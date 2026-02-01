@@ -1,20 +1,15 @@
-//process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
+process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
 
 const filterPatterns = [
   'Closing open session','Closing session:','SessionEntry','pendingPreKey','_chains:',
   'currentRatchet:','ephemeralKeyPair:','<Buffer','indexInfo:','registrationId:',
   'chainKey:','rootKey:','baseKey:','remoteIdentityKey:','previousCounter:',
   'chainType:','messageKeys:','pubKey:','privKey:','lastRemoteEphemeralKey:',
-  'baseKeyType:','closed:','used:','created:','Caught exception:','AxiosError:',
-  'socket hang up','ECONNRESET','_writableState:','_events:','_options:',
-  'transitional:','Symbol(','_currentRequest:','_header:','highWaterMark:',
-  '[cause]:','Session error:','Session error:Error','Failed to decrypt message',
-  'Failed to decrypt','Bad MAC','Bad MAC Error','{}','doDecryptWhisperMessage',
-  'decryptWithSessions','session_cipher.js','_asyncQueueExecutor','queue_job.js',
-  'libsignal/src','verifyMAC','crypto.js:87','at Object.verifyMAC',
-  'at SessionCipher','at async SessionCipher','at async _asyncQueueExecutor',
-  'in favor of incoming prekey','Closing open session in favor','Total file sesi',
-  'Terdeteksi','file sampah','Anti Spam Case'
+  'baseKeyType:','closed:','used:','created:','AxiosError:','socket hang up',
+  'ECONNRESET','_writableState:','_events:','_options:','transitional:',
+  'Symbol(','_currentRequest:','_header:','highWaterMark:','[cause]:',
+  'Session error:','Failed to decrypt','Bad MAC','doDecryptWhisperMessage',
+  'decryptWithSessions','session_cipher.js','libsignal/src','verifyMAC'
 ];
 
 const utilInspect = require("util").inspect;
@@ -26,18 +21,13 @@ const shouldFilter = (args) => {
     const str = args.map(a => {
       if (typeof a === "string") return a;
       if (a === null || a === undefined) return "";
-      if (typeof a === "object") {
-        try {
-          return utilInspect(a, { depth: 2, maxStringLength: 500 });
-        } catch {
-          return String(a);
-        }
-      }
+      if (typeof a === "object") return utilInspect(a, { depth: 2, maxStringLength: 500 });
       return String(a);
     }).join(" ");
-    for (const p of filterPatterns) if (str.includes(p)) return true;
-  } catch {}
-  return false;
+    return filterPatterns.some(p => str.includes(p));
+  } catch {
+    return false;
+  }
 };
 
 console.log = (...args) => { if (!shouldFilter(args)) originalConsoleLog(...args); };
@@ -59,7 +49,7 @@ import fs, { readdirSync, existsSync, readFileSync, watch, statSync } from "fs";
 import logg from "pino";
 import { Socket, smsg, protoType } from "./lib/simple.js";
 import CFonts from "cfonts";
-import path, { join, dirname } from "path";
+import path, { join, dirname, basename } from "path";
 import { memberUpdate } from "./message/group.js";
 import { antiCall } from "./message/anticall.js";
 import { connectionUpdate } from "./message/connection.js";
@@ -91,22 +81,6 @@ global.reloadHandler = async function () {
 
 const pluginFolder = path.join(__dirname, "./plugins");
 
-const { exec } = await import("child_process");
-async function checkBaileysUpdates() {
-  try {
-    exec("npm view @rexxhayanasi/elaina-baileys version", (err, stdout) => {
-      if (err) return;
-      const latest = stdout.trim();
-      const installed = (require("./package.json").dependencies || {}).baileys || "";
-      if (!installed.includes(latest)) {
-        console.log("Elaina Baileys update available:", { installed, latest });
-      }
-    });
-  } catch {}
-}
-checkBaileysUpdates();
-setInterval(checkBaileysUpdates, 1000 * 60 * 60 * 24);
-
 const pluginFilter = filename => /\.js$/.test(filename);
 global.plugins = {};
 
@@ -134,28 +108,22 @@ global.reload = async (_ev, filename) => {
   if (!pluginFilter(filename)) return;
   let dir = global.__filename(join(filename), true);
   if (!existsSync(dir)) return delete global.plugins[filename];
-
-  let err = syntaxerror(readFileSync(dir), filename, {
-    sourceType: "module",
-    allowAwaitOutsideFunction: true
-  });
-
+  let err = syntaxerror(readFileSync(dir), filename, { sourceType: "module", allowAwaitOutsideFunction: true });
   if (!err) {
     const module = await import(`${global.__filename(dir)}?update=${Date.now()}`);
     global.plugins[filename] = module.default || module;
-    global.plugins = Object.fromEntries(
-      Object.entries(global.plugins).sort(([a],[b]) => a.localeCompare(b))
-    );
+    global.plugins = Object.fromEntries(Object.entries(global.plugins).sort(([a],[b]) => a.localeCompare(b)));
   }
 };
 
 chokidar.watch(pluginFolder, { ignoreInitial: true, depth: 99 })
-  .on("change", p => p.endsWith(".js") && global.reload(null, path.basename(p)));
+  .on("change", p => p.endsWith(".js") && global.reload(null, basename(p)));
 
 watch(pluginFolder, global.reload);
 
 const connectToWhatsApp = async () => {
   await (await import("./message/database.js")).default();
+
   const { state, saveCreds } = await useMultiFileAuthState(session);
   const store = makeInMemoryStore({ logger: logg().child({ level: "fatal" }) });
   const { version } = await fetchLatestBaileysVersion();
@@ -179,12 +147,22 @@ const connectToWhatsApp = async () => {
 
   store.bind(conn.ev);
 
+  if (global.pairingCode && !state.creds.registered) {
+    const code = await conn.requestPairingCode(global.pairingCode);
+    console.log("PAIRING CODE:", code);
+  }
+
   conn.ev.on("connection.update", async update => {
     if (update.connection === "open") {
       if (!queueManager) {
         queueManager = new QueueManager(global.owner || [], false);
         queueManager.initializeAdminDetector(conn, global.func);
-      } else queueManager.onReconnect(conn);
+      } else {
+        queueManager.onReconnect(conn);
+      }
+    }
+    if (update.connection === "close" && !update.isNewLogin) {
+      setTimeout(connectToWhatsApp, 3000);
     }
     await connectionUpdate(connectToWhatsApp, conn, update);
   });
