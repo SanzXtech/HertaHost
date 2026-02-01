@@ -1,0 +1,453 @@
+"use strict";
+const { default: { makeWASocket } , Browsers, DisconnectReason, fetchLatestBaileysVersion } = await import("baileys");
+import chalk from "chalk";
+import { Boom } from "@hapi/boom";
+import spin from "spinnies";
+import { spawn } from "child_process";
+import { sleep } from "../lib/myfunc.js";
+import fs from "fs-extra";
+import { Octokit } from '@octokit/rest';
+import { Buffer } from 'buffer';
+
+const spinner = {
+  interval: 120,
+  frames: [
+    "✖ [░░░░░░░░░░░░░░░]",
+    "✖ [■░░░░░░░░░░░░░░]",
+    "✖ [■■░░░░░░░░░░░░░]",
+    "✖ [■■■░░░░░░░░░░░░]",
+    "✖ [■■■■░░░░░░░░░░░]",
+    "✖ [■■■■■░░░░░░░░░░]",
+    "✖ [■■■■■■░░░░░░░░░]",
+    "✖ [■■■■■■■░░░░░░░░]",
+    "✖ [■■■■■■■■░░░░░░░]",
+    "✖ [■■■■■■■■■░░░░░░]",
+    "✖ [■■■■■■■■■■░░░░░]",
+    "✖ [■■■■■■■■■■■░░░░]",
+    "✖ [■■■■■■■■■■■■░░░]",
+    "✖ [■■■■■■■■■■■■■░░]",
+    "✖ [■■■■■■■■■■■■■■░]",
+    "✖ [■■■■■■■■■■■■■■■]",
+  ],
+};
+let globalSpinner;
+const getGlobalSpinner = (disableSpins = false) => {
+  if (!globalSpinner)
+    globalSpinner = new spin({
+      color: "blue",
+      succeedColor: "green",
+      spinner,
+      disableSpins,
+    });
+  return globalSpinner;
+};
+let spins = getGlobalSpinner(false);
+
+const start = (id, text) => {
+  spins.add(id, { text: text });
+};
+const success = (id, text) => {
+  spins.succeed(id, { text: text });
+};
+
+// Flag dan tracking untuk mencegah save berulang saat reconnect
+let hasInitialConnection = false;
+let lastSessionId = null;
+let botConnectedSent = false;
+
+// Function untuk mendapatkan session ID dari creds.json
+function getCurrentSessionId() {
+  try {
+    const sessionFilePath = './session/creds.json';
+    if (fs.existsSync(sessionFilePath)) {
+      const creds = JSON.parse(fs.readFileSync(sessionFilePath, 'utf8'));
+      // Gunakan kombinasi registrationId dan identityId sebagai unique identifier
+      return `${creds.registrationId || 'unknown'}_${creds.identityId || 'unknown'}`;
+    }
+  } catch (error) {
+    console.error("Error reading session ID:", error.message);
+  }
+  return null;
+}
+// Function untuk save session ke GitHub
+async function saveSessionToGitHub() {
+  if (!global.heroku) {
+    console.log(chalk.yellow("GitHub save disabled (global.heroku = false)"));
+    return;
+  }
+
+  if (!global.token || !global.username || !global.repo) {
+    console.log(chalk.red("GitHub credentials not configured"));
+    return;
+  }
+
+  try {
+    const sessionFilePath = './session/creds.json';
+    if (!fs.existsSync(sessionFilePath)) {
+      console.log(chalk.red("Session file not found for GitHub upload"));
+      return;
+    }
+
+    console.log(chalk.blue("Saving session to GitHub..."));
+    
+    const contentBuffer = fs.readFileSync(sessionFilePath);
+    const octokit = new Octokit({ auth: global.token });
+    const filePath = 'session/creds.json';
+
+    // Cek apakah file sudah ada di GitHub
+    let sha = null;
+    try {
+      const { data } = await octokit.repos.getContent({
+        owner: global.username,
+        repo: global.repo,
+        path: filePath,
+      });
+      sha = data?.sha || null;
+    } catch (err) {
+      // File belum ada, biarkan sha null
+      if (err.status === 404) {
+        // not found, proceed to create
+      } else if (err.status === 401) {
+        console.error(chalk.red("GitHub credentials invalid (401), disabling GitHub save"));
+        global.heroku = false;
+        return;
+      } else {
+        console.error(chalk.red("Error checking existing file:"), err.message);
+        return;
+      }
+    }
+
+    // Upload/update file ke GitHub
+    try {
+      await octokit.repos.createOrUpdateFileContents({
+        owner: global.username,
+        repo: global.repo,
+        path: filePath,
+        message: `Update session/creds.json via bot`,
+        content: contentBuffer.toString('base64'),
+        sha: sha || undefined,
+        committer: {
+          name: 'WhatsApp Bot',
+          email: 'bot@whatsapp.dev'
+        },
+        author: {
+          name: 'WhatsApp Bot',
+          email: 'bot@whatsapp.dev'
+        }
+      });
+
+      console.log(chalk.green("✅ Session successfully saved to GitHub!"));
+    } catch (err) {
+      if (err.status === 401) {
+        console.error(chalk.red("Failed to save session to GitHub: Bad credentials (401). Disabling GitHub save."));
+        global.heroku = false;
+      } else {
+        console.error(chalk.red("Failed to save session to GitHub:"), err.message);
+      }
+    }
+    
+  } catch (error) {
+    console.error(chalk.red("❌ Failed to save session to GitHub:"), error.message);
+  }
+}
+
+async function clearSession() {
+  try {
+    const files = await fs.readdir(`./${global.session}`);
+    const filteredArray = files.filter(
+      (item) =>
+        item.startsWith("pre-key") ||
+        item.startsWith("sender-key") ||
+        item.startsWith("session-")
+    );
+
+    console.log(`Terdeteksi ${filteredArray.length} file sampah`);
+    if (filteredArray.length === 0) {
+      console.log("Tidak ada file sampah untuk dihapus.");
+      return;
+    }
+
+    console.log("Menghapus file sampah session...");
+    for (const file of filteredArray) {
+      await fs.unlink(`./${global.session}/${file}`);
+    }
+
+    console.log("Berhasil menghapus semua sampah di folder session.");
+  } catch (err) {
+    console.error("Gagal membersihkan folder session:", err);
+  }
+}
+
+// Fungsi reconnect yang bisa dipanggil dari handler global ketika terjadi Bad MAC
+let reconnectFn = null;
+let lastBadMacAt = 0;
+const BADMAC_COOLDOWN_MS = 60 * 1000; // 1 menit cooldown
+
+// Animated spinner for reconnect (not log spam)
+let reconnectSpinner = null;
+const reconnectSpinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+let reconnectSpinnerIndex = 0;
+let reconnectSpinnerInterval = null;
+
+function startReconnectSpinner() {
+  if (reconnectSpinnerInterval) clearInterval(reconnectSpinnerInterval);
+  reconnectSpinnerIndex = 0;
+  process.stdout.write('⟳ Connecting... ');
+  reconnectSpinnerInterval = setInterval(() => {
+    process.stdout.write('\b' + reconnectSpinnerFrames[reconnectSpinnerIndex]);
+    reconnectSpinnerIndex = (reconnectSpinnerIndex + 1) % reconnectSpinnerFrames.length;
+  }, 80);
+}
+
+function stopReconnectSpinner() {
+  if (reconnectSpinnerInterval) {
+    clearInterval(reconnectSpinnerInterval);
+    reconnectSpinnerInterval = null;
+    process.stdout.write('\b '); // Clear spinner
+  }
+}
+
+export const connectionUpdate = async (connectToWhatsApp, conn, update) => {
+  // Simpan referensi fungsi reconnect untuk dipanggil oleh handler global
+  reconnectFn = connectToWhatsApp;
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  const {
+    connection,
+    lastDisconnect,
+    receivedPendingNotifications,
+    isNewLogin,
+    qr,
+  } = update;
+
+  const reason = new Boom(lastDisconnect?.error)?.output.statusCode;
+  if (connection === "close") {
+    stopReconnectSpinner();
+    console.log(chalk.red(lastDisconnect.error));
+
+    if (lastDisconnect.error == "Error: Stream Errored (unknown)") {
+      process.send("reset");
+    } else if (reason === DisconnectReason.badSession) {
+      console.log(`Bad Session File, Please Delete Session and Scan Again`);
+      process.send("reset");
+    } else if (reason === DisconnectReason.connectionClosed) {
+      startReconnectSpinner();
+      process.send("reset");
+    } else if (reason === DisconnectReason.connectionLost) {
+      startReconnectSpinner();
+      process.send("reset");
+    } else if (reason === DisconnectReason.connectionReplaced) {
+      stopReconnectSpinner();
+      console.log(
+        chalk.red(
+          "Connection Replaced, Another New Session Opened, Please Close Current Session First"
+        )
+      );
+      conn.logout();
+    } else if (reason === DisconnectReason.loggedOut) {
+      stopReconnectSpinner();
+      console.log(chalk.red(`Device Logged Out, Please Scan Again And Run.`));
+      conn.logout();
+      hasInitialConnection = false;
+      lastSessionId = null;
+      botConnectedSent = false;
+    } else if (reason === DisconnectReason.restartRequired) {
+      stopReconnectSpinner();
+      console.log(chalk.yellow("↻ Restarting..."));
+      connectToWhatsApp();
+      process.send("reset");
+    } else if (reason === DisconnectReason.timedOut) {
+      startReconnectSpinner();
+      connectToWhatsApp();
+    }
+  } else if (connection === "connecting") {
+    if (!global.pairingCode) {
+      start(`1`, `⟳ Connecting...`);
+    }
+  } else if (connection === "open") {
+    stopReconnectSpinner();
+
+    // Clear session saat koneksi terbuka
+    await clearSession();
+
+    // Dapatkan session ID saat ini
+    const currentSessionId = getCurrentSessionId();
+    
+    // Cek apakah ini session yang benar-benar baru
+    const isNewSession = !lastSessionId || lastSessionId !== currentSessionId;
+    const shouldSaveToGitHub = !hasInitialConnection || isNewLogin || isNewSession;
+    
+    if (shouldSaveToGitHub) {
+      console.log(chalk.blue("New session detected or initial connection"));
+      hasInitialConnection = true;
+      lastSessionId = currentSessionId;
+      botConnectedSent = false; // Reset flag kirim pesan
+      
+      // Save ke GitHub setelah delay 5 detik
+      setTimeout(async () => {
+        await saveSessionToGitHub();
+      }, 5000);
+    } else {
+      console.log(chalk.yellow("Same session reconnection detected, skipping GitHub save"));
+    }
+
+    // Kirim pesan Bot Connected ke owner hanya jika belum dikirim untuk session ini
+    if (!botConnectedSent && (shouldSaveToGitHub || isNewSession)) {
+      setTimeout(async () => {
+        try {
+          if (global.nomerOwner) {
+            const ownerJid = `${global.nomerOwner}@s.whatsapp.net`;
+            await conn.sendMessage(ownerJid, { text: "*Bot Connected*" });
+            console.log(chalk.green("Bot connected message sent to owner."));
+            botConnectedSent = true; // Set flag sudah dikirim
+          }
+        } catch (err) {
+          console.error("Failed to send bot connected message:", err);
+        }
+      }, 10000);
+    } else {
+      console.log(chalk.yellow("Bot connected message already sent for this session"));
+    }
+
+    const bot = db.data.others["restart"];
+    if (bot) {
+      const m = bot.m;
+      const from = bot.from;
+      let text = "Bot is connected";
+      await conn.sendMessage(from, { text }, { quoted: m });
+      delete db.data.others["restart"];
+    }
+
+    // Quick Test
+    async function _quickTest() {
+      let test = await Promise.all(
+        [
+          spawn("ffmpeg"),
+          spawn("ffprobe"),
+          spawn("ffmpeg", [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-filter_complex",
+            "color",
+            "-frames:v",
+            "1",
+            "-f",
+            "webp",
+            "-",
+          ]),
+          spawn("convert"),
+          spawn("magick"),
+          spawn("gm"),
+          spawn("find", ["--version"]),
+        ].map((p) => {
+          return Promise.race([
+            new Promise((resolve) => {
+              p.on("close", (code) => {
+                resolve(code !== 127);
+              });
+            }),
+            new Promise((resolve) => {
+              p.on("error", (_) => resolve(false));
+            }),
+          ]);
+        })
+      );
+      let [ffmpeg, ffprobe, ffmpegWebp, convert, magick, gm, find] = test;
+      let s = (global.support = {
+        ffmpeg,
+        ffprobe,
+        ffmpegWebp,
+        convert,
+        magick,
+        gm,
+        find,
+      });
+      Object.freeze(global.support);
+
+      if (!s.ffmpeg)
+        conn.logger.warn(
+          "Please install ffmpeg for sending videos (pkg install ffmpeg)"
+        );
+      if (s.ffmpeg && !s.ffmpegWebp)
+        conn.logger.warn(
+          "Stickers may not animated without libwebp on ffmpeg (--enable-libwebp while compiling ffmpeg)"
+        );
+      if (!s.convert && !s.magick && !s.gm)
+        conn.logger.warn(
+          "Stickers may not work without imagemagick if libwebp on ffmpeg isntalled (pkg install imagemagick)"
+        );
+    }
+
+    _quickTest()
+      .then(() => conn.logger.info("☑️ Quick Test Done"))
+      .catch(console.error);
+  }
+}; // akhir connection
+
+// Global error handlers to catch Bad MAC and similar session issues
+// Perubahan: jangan matikan proses ketika Bad MAC terdeteksi.
+// Sebagai gantinya hapus pre-key/session sementara dan lakukan reconnect grace
+// agar Baileys dapat "minta key lagi" ke client WhatsApp tanpa menghentikan bot.
+process.on('uncaughtException', async (err) => {
+  try {
+    console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+    const msg = (err && (err.message || err)) || '';
+    if (msg && msg.toString().includes('Bad MAC')) {
+      console.error('[SESSION] Detected Bad MAC error — clearing session files and attempting graceful reconnect');
+      await clearSession();
+      const now = Date.now();
+      if (reconnectFn && (now - lastBadMacAt) > BADMAC_COOLDOWN_MS) {
+        lastBadMacAt = now;
+        setTimeout(async () => {
+          try {
+            console.log('[SESSION] Triggering reconnect to request new keys from client...');
+            try {
+              if (global.nomerOwner && global.conn) {
+                await global.conn.sendMessage(`${global.nomerOwner}@s.whatsapp.net`, { text: "[AUTO] Bad MAC detected — meminta key ulang ke client. Bot tetap berjalan." });
+              }
+            } catch (notifyErr) { console.error('[SESSION] Failed to notify owner:', notifyErr); }
+            await reconnectFn();
+          } catch (e) {
+            console.error('[SESSION] Reconnect after Bad MAC failed:', e);
+          }
+        }, 3000);
+      } else {
+        console.log('[SESSION] Reconnect suppressed (cooldown or no reconnect function available)');
+      }
+    }
+  } catch (e) {
+    console.error('Error handling uncaughtException:', e);
+  }
+});
+
+process.on('unhandledRejection', async (reason) => {
+  try {
+    console.error('[unhandledRejection]', reason);
+    const msg = (reason && (reason.message || reason)) || '';
+    if (msg && msg.toString().includes('Bad MAC')) {
+      console.error('[SESSION] Detected Bad MAC in rejection — clearing session files and attempting graceful reconnect');
+      await clearSession();
+      const now = Date.now();
+      if (reconnectFn && (now - lastBadMacAt) > BADMAC_COOLDOWN_MS) {
+        lastBadMacAt = now;
+        setTimeout(async () => {
+          try {
+            console.log('[SESSION] Triggering reconnect to request new keys from client...');
+            try {
+              if (global.nomerOwner && global.conn) {
+                await global.conn.sendMessage(`${global.nomerOwner}@s.whatsapp.net`, { text: "[AUTO] Bad MAC detected — meminta key ulang ke client. Bot tetap berjalan." });
+              }
+            } catch (notifyErr) { console.error('[SESSION] Failed to notify owner:', notifyErr); }
+            await reconnectFn();
+          } catch (e) {
+            console.error('[SESSION] Reconnect after Bad MAC failed:', e);
+          }
+        }, 3000);
+      } else {
+        console.log('[SESSION] Reconnect suppressed (cooldown or no reconnect function available)');
+      }
+    }
+  } catch (e) {
+    console.error('Error handling unhandledRejection:', e);
+  }
+});
